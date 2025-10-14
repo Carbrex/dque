@@ -1,6 +1,4 @@
-//
 // Package dque is a fast embedded durable queue for Go
-//
 package dque
 
 //
@@ -62,89 +60,18 @@ type DQue struct {
 
 	emptyCond *sync.Cond
 
-	turbo bool
+	turbo   bool
+	useJSON bool
 }
 
 // New creates a new durable queue
 func New(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
-
-	// Validation
-	if len(name) == 0 {
-		return nil, errors.New("the queue name requires a value")
-	}
-	if len(dirPath) == 0 {
-		return nil, errors.New("the queue directory requires a value")
-	}
-	if !dirExists(dirPath) {
-		return nil, errors.New("the given queue directory is not valid: " + dirPath)
-	}
-	fullPath := path.Join(dirPath, name)
-	if dirExists(fullPath) {
-		return nil, errors.New("the given queue directory already exists: " + fullPath + ". Use Open instead")
-	}
-
-	if err := os.Mkdir(fullPath, 0755); err != nil {
-		return nil, errors.Wrap(err, "error creating queue directory "+fullPath)
-	}
-
-	q := DQue{Name: name, DirPath: dirPath}
-	q.fullPath = fullPath
-	q.config.ItemsPerSegment = itemsPerSegment
-	q.builder = builder
-	q.emptyCond = sync.NewCond(&q.mutex)
-
-	if err := q.lock(); err != nil {
-		return nil, err
-	}
-
-	if err := q.load(); err != nil {
-		er := q.fileLock.Unlock()
-		if er != nil {
-			return nil, er
-		}
-		return nil, err
-	}
-
-	return &q, nil
+	return newDQue(name, dirPath, itemsPerSegment, false, builder, true)
 }
 
 // Open opens an existing durable queue.
 func Open(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
-
-	// Validation
-	if len(name) == 0 {
-		return nil, errors.New("the queue name requires a value")
-	}
-	if len(dirPath) == 0 {
-		return nil, errors.New("the queue directory requires a value")
-	}
-	if !dirExists(dirPath) {
-		return nil, errors.New("the given queue directory is not valid (" + dirPath + ")")
-	}
-	fullPath := path.Join(dirPath, name)
-	if !dirExists(fullPath) {
-		return nil, errors.New("the given queue does not exist (" + fullPath + ")")
-	}
-
-	q := DQue{Name: name, DirPath: dirPath}
-	q.fullPath = fullPath
-	q.config.ItemsPerSegment = itemsPerSegment
-	q.builder = builder
-	q.emptyCond = sync.NewCond(&q.mutex)
-
-	if err := q.lock(); err != nil {
-		return nil, err
-	}
-
-	if err := q.load(); err != nil {
-		er := q.fileLock.Unlock()
-		if er != nil {
-			return nil, er
-		}
-		return nil, err
-	}
-
-	return &q, nil
+	return newDQue(name, dirPath, itemsPerSegment, false, builder, false)
 }
 
 // NewOrOpen either creates a new queue or opens an existing durable queue.
@@ -166,6 +93,88 @@ func NewOrOpen(name string, dirPath string, itemsPerSegment int, builder func() 
 	}
 
 	return New(name, dirPath, itemsPerSegment, builder)
+}
+
+// NewJSON creates a new durable queue with JSON encoding
+func NewJSON(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
+	return newDQue(name, dirPath, itemsPerSegment, true, builder, true)
+}
+
+// OpenJSON opens an existing durable queue with JSON encoding for new items
+func OpenJSON(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
+	return newDQue(name, dirPath, itemsPerSegment, true, builder, false)
+}
+
+// NewOrOpenJSON either creates a new queue or opens an existing durable queue with JSON encoding
+func NewOrOpenJSON(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
+	// Validation
+	if len(name) == 0 {
+		return nil, errors.New("the queue name requires a value")
+	}
+	if len(dirPath) == 0 {
+		return nil, errors.New("the queue directory requires a value")
+	}
+	if !dirExists(dirPath) {
+		return nil, errors.New("the given queue directory is not valid (" + dirPath + ")")
+	}
+	fullPath := path.Join(dirPath, name)
+	if dirExists(fullPath) {
+		return OpenJSON(name, dirPath, itemsPerSegment, builder)
+	}
+
+	return NewJSON(name, dirPath, itemsPerSegment, builder)
+}
+
+// newDQue is the internal helper function for creating/opening queues
+func newDQue(name string, dirPath string, itemsPerSegment int, useJSON bool, builder func() interface{}, createNew bool) (*DQue, error) {
+	// Validation
+	if len(name) == 0 {
+		return nil, errors.New("the queue name requires a value")
+	}
+	if len(dirPath) == 0 {
+		return nil, errors.New("the queue directory requires a value")
+	}
+	if !dirExists(dirPath) {
+		if createNew {
+			return nil, errors.New("the given queue directory is not valid: " + dirPath)
+		} else {
+			return nil, errors.New("the given queue directory is not valid (" + dirPath + ")")
+		}
+	}
+	fullPath := path.Join(dirPath, name)
+
+	if createNew {
+		if dirExists(fullPath) {
+			return nil, errors.New("the given queue directory already exists: " + fullPath + ". Use Open instead")
+		}
+		if err := os.Mkdir(fullPath, 0755); err != nil {
+			return nil, errors.Wrap(err, "error creating queue directory "+fullPath)
+		}
+	} else {
+		if !dirExists(fullPath) {
+			return nil, errors.New("the given queue does not exist (" + fullPath + ")")
+		}
+	}
+
+	q := DQue{Name: name, DirPath: dirPath, useJSON: useJSON}
+	q.fullPath = fullPath
+	q.config.ItemsPerSegment = itemsPerSegment
+	q.builder = builder
+	q.emptyCond = sync.NewCond(&q.mutex)
+
+	if err := q.lock(); err != nil {
+		return nil, err
+	}
+
+	if err := q.load(); err != nil {
+		er := q.fileLock.Unlock()
+		if er != nil {
+			return nil, er
+		}
+		return nil, err
+	}
+
+	return &q, nil
 }
 
 // Close releases the lock on the queue rendering it unusable for further usage by this instance.
@@ -221,7 +230,7 @@ func (q *DQue) Enqueue(obj interface{}) error {
 	if q.lastSegment.sizeOnDisk() >= q.config.ItemsPerSegment {
 
 		// We have filled our last segment to capacity, so create a new one
-		seg, err := newQueueSegment(q.fullPath, q.lastSegment.number+1, q.turbo, q.builder)
+		seg, err := newQueueSegment(q.fullPath, q.lastSegment.number+1, q.turbo, q.useJSON, q.builder)
 		if err != nil {
 			return errors.Wrapf(err, "error creating new queue segment: %d.", q.lastSegment.number+1)
 		}
@@ -290,7 +299,7 @@ func (q *DQue) dequeueLocked() (interface{}, error) {
 		if q.firstSegment.number == q.lastSegment.number {
 
 			// Create the next segment
-			seg, err := newQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.builder)
+			seg, err := newQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.useJSON, q.builder)
 			if err != nil {
 				return obj, errors.Wrap(err, "error creating new segment. Queue is in an inconsistent state")
 			}
@@ -305,7 +314,7 @@ func (q *DQue) dequeueLocked() (interface{}, error) {
 			} else {
 
 				// Open the next segment
-				seg, err := openQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.builder)
+				seg, err := openQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.useJSON, q.builder)
 				if err != nil {
 					return obj, errors.Wrap(err, "error creating new segment. Queue is in an inconsistent state")
 				}
@@ -531,7 +540,7 @@ func (q *DQue) load() error {
 
 		// We found files
 		for {
-			seg, err := openQueueSegment(q.fullPath, minNum, q.turbo, q.builder)
+			seg, err := openQueueSegment(q.fullPath, minNum, q.turbo, q.useJSON, q.builder)
 			if err != nil {
 				return errors.Wrap(err, "unable to create queue segment in "+q.fullPath)
 			}
@@ -552,7 +561,7 @@ func (q *DQue) load() error {
 			q.lastSegment = q.firstSegment
 		} else {
 			// We have multiple segments
-			seg, err := openQueueSegment(q.fullPath, maxNum, q.turbo, q.builder)
+			seg, err := openQueueSegment(q.fullPath, maxNum, q.turbo, q.useJSON, q.builder)
 			if err != nil {
 				return errors.Wrap(err, "unable to create segment for "+q.fullPath)
 			}
@@ -561,7 +570,7 @@ func (q *DQue) load() error {
 
 	} else {
 		// We found no files so build a new queue starting with segment 1
-		seg, err := newQueueSegment(q.fullPath, 1, q.turbo, q.builder)
+		seg, err := newQueueSegment(q.fullPath, 1, q.turbo, q.useJSON, q.builder)
 		if err != nil {
 			return errors.Wrap(err, "unable to create queue segment in "+q.fullPath)
 		}

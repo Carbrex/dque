@@ -25,6 +25,7 @@ import (
 	"path"
 	"sync"
 
+	jsoniter "github.com/json-iterator/go"
 	"github.com/pkg/errors"
 )
 
@@ -77,6 +78,7 @@ type qSegment struct {
 	turbo         bool
 	maybeDirty    bool  // filesystem changes may not have been flushed to disk
 	syncCount     int64 // for testing
+	useJSON       bool  // true if this segment uses JSON encoding instead of gob
 }
 
 // load reads all objects from the queue file into a slice
@@ -129,16 +131,47 @@ func (seg *qSegment) load() error {
 		if _, err := io.ReadFull(seg.file, data); err != nil {
 			return ErrCorruptedSegment{
 				Path: seg.filePath(),
-				Err:  errors.Wrap(err, "error reading gob data from file"),
+				Err:  errors.Wrap(err, "error reading data from file"),
 			}
 		}
 
 		// Decode the bytes into an object
 		object := seg.objectBuilder()
-		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(object); err != nil {
-			return ErrUnableToDecode{
-				Path: seg.filePath(),
-				Err:  errors.Wrapf(err, "failed to decode %T", object),
+
+		// Check if this is new format with format flag
+		if len(data) > 0 && (data[0] == 0x00 || data[0] == 0x01) {
+			// Potential new format - try to validate
+			if seg.looksLikeNewFormat(data) {
+				// New format: first byte is format flag, rest is encoded data
+				formatFlag := data[0]
+				actualData := data[1:]
+
+				if formatFlag == 0x01 {
+					// JSON encoding
+					if jsonErr := jsoniter.Unmarshal(actualData, object); jsonErr != nil {
+						return ErrUnableToDecode{
+							Path: seg.filePath(),
+							Err:  errors.Wrapf(jsonErr, "failed to decode %T with JSON", object),
+						}
+					}
+					seg.useJSON = true
+				} else {
+					// Gob encoding
+					if err := gob.NewDecoder(bytes.NewReader(actualData)).Decode(object); err != nil {
+						return ErrUnableToDecode{
+							Path: seg.filePath(),
+							Err:  errors.Wrapf(err, "failed to decode %T with gob", object),
+						}
+					}
+				}
+			} else {
+				// Legacy format - use fallback
+				seg.decodeLegacyFormat(data, object)
+			}
+		} else {
+			// Legacy format - use fallback
+			if err := seg.decodeLegacyFormat(data, object); err != nil {
+				return err
 			}
 		}
 
@@ -147,6 +180,51 @@ func (seg *qSegment) load() error {
 
 		// log.Printf("TEMP: Loaded: %#v\n", object)
 	}
+}
+
+// looksLikeNewFormat checks if the data appears to be in new format with format flag
+func (seg *qSegment) looksLikeNewFormat(data []byte) bool {
+	if len(data) < 2 {
+		return false // Too short to have flag + data
+	}
+
+	formatFlag := data[0]
+	if formatFlag != 0x00 && formatFlag != 0x01 {
+		return false // Invalid format flag
+	}
+
+	actualData := data[1:]
+
+	// Basic validation: try to see if remaining data could be valid encoded data
+	if formatFlag == 0x01 {
+		// For JSON, check if it starts with valid JSON characters
+		if len(actualData) > 0 {
+			firstChar := actualData[0]
+			return firstChar == '{' || firstChar == '[' || firstChar == '"'
+		}
+	} else {
+		// For gob, check minimum length (gob has overhead)
+		return len(actualData) > 10
+	}
+
+	return false
+}
+
+// decodeLegacyFormat handles the legacy format with gob-then-JSON fallback
+func (seg *qSegment) decodeLegacyFormat(data []byte, object interface{}) error {
+	// Try gob decoding first for backward compatibility
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(object); err != nil {
+		// If gob fails, try JSON decoding
+		if jsonErr := jsoniter.Unmarshal(data, object); jsonErr != nil {
+			return ErrUnableToDecode{
+				Path: seg.filePath(),
+				Err:  errors.Wrapf(err, "failed to decode %T with both gob (%v) and JSON (%v)", object, err, jsonErr),
+			}
+		}
+		// Successfully decoded with JSON, mark segment as using JSON
+		seg.useJSON = true
+	}
+	return nil
 }
 
 // peek returns the first item in the segment without removing it.
@@ -216,25 +294,48 @@ func (seg *qSegment) add(object interface{}) error {
 	seg.mutex.Lock()
 	defer seg.mutex.Unlock()
 
-	// Encode the struct to a byte buffer
+	// Encode the struct to a byte buffer based on useJSON flag
 	var buff bytes.Buffer
-	enc := gob.NewEncoder(&buff)
-	if err := enc.Encode(object); err != nil {
-		return errors.Wrap(err, "error gob encoding object")
+	var err error
+
+	if seg.useJSON {
+		// Use JSON encoding
+		jsonBytes, jsonErr := jsoniter.Marshal(object)
+		if jsonErr != nil {
+			return errors.Wrap(jsonErr, "error JSON encoding object")
+		}
+		buff.Write(jsonBytes)
+	} else {
+		// Use gob encoding
+		enc := gob.NewEncoder(&buff)
+		err = enc.Encode(object)
+		if err != nil {
+			return errors.Wrap(err, "error gob encoding object")
+		}
 	}
 
-	// Count the bytes stored in the byte buffer
-	// and store the count into a 4-byte byte array
-	buffLen := len(buff.Bytes())
+	// Create format flag for new format
+	var formatFlag byte = 0x00 // gob encoding
+	if seg.useJSON {
+		formatFlag = 0x01 // JSON encoding
+	}
+
+	// Count the bytes: encoded data + 1 byte for format flag
+	buffLen := len(buff.Bytes()) + 1
 	buffLenBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buffLenBytes, uint32(buffLen))
 
-	// Write the 4-byte buffer length first
+	// Write the 4-byte buffer length first (includes format flag)
 	if _, err := seg.file.Write(buffLenBytes); err != nil {
 		return errors.Wrapf(err, "failed to write object length to segment %d", seg.number)
 	}
 
-	// Then write the buffer bytes
+	// Write the format flag
+	if _, err := seg.file.Write([]byte{formatFlag}); err != nil {
+		return errors.Wrapf(err, "failed to write format flag to segment %d", seg.number)
+	}
+
+	// Then write the encoded data bytes
 	if _, err := seg.file.Write(buff.Bytes()); err != nil {
 		return errors.Wrapf(err, "failed to write object to segment %d", seg.number)
 	}
@@ -372,9 +473,9 @@ func (seg *qSegment) close() error {
 }
 
 // newQueueSegment creates a new, persistent  segment of the queue
-func newQueueSegment(dirPath string, number int, turbo bool, builder func() interface{}) (*qSegment, error) {
+func newQueueSegment(dirPath string, number int, turbo bool, useJSON bool, builder func() interface{}) (*qSegment, error) {
 
-	seg := qSegment{dirPath: dirPath, number: number, turbo: turbo, objectBuilder: builder}
+	seg := qSegment{dirPath: dirPath, number: number, turbo: turbo, useJSON: useJSON, objectBuilder: builder}
 
 	if !dirExists(seg.dirPath) {
 		return nil, errors.New("dirPath is not a valid directory: " + seg.dirPath)
@@ -396,9 +497,9 @@ func newQueueSegment(dirPath string, number int, turbo bool, builder func() inte
 }
 
 // openQueueSegment reads an existing persistent segment of the queue into memory
-func openQueueSegment(dirPath string, number int, turbo bool, builder func() interface{}) (*qSegment, error) {
+func openQueueSegment(dirPath string, number int, turbo bool, useJSON bool, builder func() interface{}) (*qSegment, error) {
 
-	seg := qSegment{dirPath: dirPath, number: number, turbo: turbo, objectBuilder: builder}
+	seg := qSegment{dirPath: dirPath, number: number, turbo: turbo, useJSON: useJSON, objectBuilder: builder}
 
 	if !dirExists(seg.dirPath) {
 		return nil, errors.New("dirPath is not a valid directory: " + seg.dirPath)
