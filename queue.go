@@ -1,6 +1,4 @@
-//
 // Package dque is a fast embedded durable queue for Go
-//
 package dque
 
 //
@@ -182,9 +180,11 @@ func NewOrOpenWithCodec(name string, dirPath string, itemsPerSegment int, builde
 // Close releases the lock on the queue rendering it unusable for further usage by this instance.
 // Close will return an error if it has already been called.
 func (q *DQue) Close() error {
+	// only allow Close while no other function is active
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
+	// Finally mark this instance as closed to prevent any further access
 	if q.fileLock == nil {
 		return ErrQueueClosed
 	}
@@ -199,6 +199,17 @@ func (q *DQue) Close() error {
 	// Wake-up any waiting goroutines for blocking queue access - they should get a ErrQueueClosed
 	q.emptyCond.Broadcast()
 
+	// Close the first and last segments' file handles
+	if err = q.firstSegment.close(); err != nil {
+		return err
+	}
+	if q.firstSegment != q.lastSegment {
+		if err = q.lastSegment.close(); err != nil {
+			return err
+		}
+	}
+
+	// Safe-guard ourself from accidentally using segments after closing the queue
 	q.firstSegment = nil
 	q.lastSegment = nil
 
@@ -207,6 +218,7 @@ func (q *DQue) Close() error {
 
 // Enqueue adds an item to the end of the queue
 func (q *DQue) Enqueue(obj interface{}) error {
+	// This is heavy-handed but its safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -216,25 +228,30 @@ func (q *DQue) Enqueue(obj interface{}) error {
 
 	// If this segment is full then create a new one
 	if q.lastSegment.sizeOnDisk() >= q.config.ItemsPerSegment {
-
+		// We have filled our last segment to capacity, so create a new one
 		seg, err := newQueueSegment(q.fullPath, q.lastSegment.number+1, q.turbo, q.builder, q.codec)
 		if err != nil {
 			return errors.Wrapf(err, "error creating new queue segment: %d.", q.lastSegment.number+1)
 		}
 
+		// If the last segment is not the first segment
+		// then we need to close the file.
 		if q.firstSegment != q.lastSegment {
 			if err := q.lastSegment.close(); err != nil {
 				return errors.Wrapf(err, "error closing previous segment file #%d.", q.lastSegment.number)
 			}
 		}
 
+		// Replace the last segment with the new one
 		q.lastSegment = seg
 	}
 
+	// Add the object to the last segment
 	if err := q.lastSegment.add(obj); err != nil {
 		return errors.Wrap(err, "error adding item to the last segment")
 	}
 
+	// Wakeup any goroutine that is currently waiting for an item to be enqueued
 	q.emptyCond.Broadcast()
 
 	return nil
