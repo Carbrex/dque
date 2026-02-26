@@ -38,15 +38,13 @@ func testQueue_AddRemoveLoop(t *testing.T, turbo bool) {
 		t.Fatal("Error removing queue directory", err)
 	}
 
-	// Create a new queue with segment size of 3
-	var err error
 	q := newQ(t, qName, turbo)
 
 	for i := 0; i < 4; i++ {
 		if err := q.Enqueue(&item2{i}); err != nil {
 			t.Fatal("Error enqueueing", err)
 		}
-		_, err = q.Dequeue()
+		_, err := q.Dequeue()
 		if err != nil {
 			t.Fatal("Error dequeueing", err)
 		}
@@ -55,23 +53,14 @@ func testQueue_AddRemoveLoop(t *testing.T, turbo bool) {
 	assert(t, 0 == q.Size(), "Size is not 0")
 
 	firstSegNum, lastSegNum := q.SegmentNumbers()
-
-	// Assert that we have just one segment
 	assert(t, firstSegNum == lastSegNum, "The first segment must match the last")
-
-	// Assert that the first segment is #2
 	assert(t, 2 == firstSegNum, "The first segment is not 2")
 
-	// Now reopen the queue and check our assertions again.
 	q.Close()
 	q = openQ(t, qName, turbo)
 
 	firstSegNum, lastSegNum = q.SegmentNumbers()
-
-	// Assert that we have just one segment
 	assert(t, firstSegNum == lastSegNum, "After opening, the first segment must match the second")
-
-	// Assert that the first segment is #2
 	assert(t, 2 == firstSegNum, "After opening, the first segment is not 2")
 
 	if err := os.RemoveAll(qName); err != nil {
@@ -79,32 +68,28 @@ func testQueue_AddRemoveLoop(t *testing.T, turbo bool) {
 	}
 }
 
-// Adds 2 and removes 1 in a loop to ensure that when we've filled
-// up the first segment that we delete it and move on to the next segment
+// Adds 2 and removes 1 in a loop
 func TestQueue_Add2Remove1(t *testing.T) {
 	testQueue_Add2Remove1(t, true /* true=turbo */)
 	testQueue_Add2Remove1(t, false /* true=turbo */)
 }
+
 func testQueue_Add2Remove1(t *testing.T, turbo bool) {
 	qName := "test1"
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory", err)
 	}
 
-	// Create a new queue with segment size of 3
-	var err error
 	q := newQ(t, qName, turbo)
 
-	// Add 2 and remove one each loop
 	for i := 0; i < 4; i = i + 2 {
-		var item interface{}
 		if err := q.Enqueue(&item2{i}); err != nil {
 			t.Fatal("Error enqueueing", err)
 		}
 		if err := q.Enqueue(&item2{i + 1}); err != nil {
 			t.Fatal("Error enqueueing", err)
 		}
-		item, err = q.Dequeue()
+		item, err := q.Dequeue()
 		if err != nil {
 			t.Fatal("Error dequeueing", err)
 		}
@@ -112,33 +97,22 @@ func testQueue_Add2Remove1(t *testing.T, turbo bool) {
 	}
 
 	firstSegNum, lastSegNum := q.SegmentNumbers()
-
-	// Assert that we have more than one segment
 	assert(t, firstSegNum < lastSegNum, "The first segment cannot match the second")
-
-	// Assert that the first segment is #2
 	assert(t, 2 == lastSegNum, "The last segment must be 2")
 
-	// Now reopen the queue and check our assertions again.
 	q.Close()
 	q = openQ(t, qName, turbo)
 
 	firstSegNum, lastSegNum = q.SegmentNumbers()
-
-	// Assert that we have more than one segment
 	assert(t, firstSegNum < lastSegNum, "After opening, the first segment can not match the second")
-
-	// Assert that the first segment is #2
 	assert(t, 2 == lastSegNum, "After opening, the last segment must be 2")
 
-	// Test Peek to make sure the size doesn't change
 	assert(t, 2 == q.Size(), "Queue size is not 2 before peeking")
 	obj, err := q.Peek()
 	if err != nil {
 		t.Fatal("Error peeking at the queue", err)
 	}
-
-	assert(t, 2 == q.Size(), "After peaking, aueue size must still be 2")
+	assert(t, 2 == q.Size(), "After peeking, queue size must still be 2")
 	assert(t, obj != nil, "Peeked object must not be nil.")
 
 	if err := os.RemoveAll(qName); err != nil {
@@ -158,35 +132,25 @@ func testQueue_Add9Remove8(t *testing.T, turbo bool) {
 		t.Fatal("Error removing queue directory", err)
 	}
 
-	// Create new queue with segment size 3
 	q := newQ(t, qName, turbo)
 
-	// Enqueue 9 items
 	for i := 0; i < 9; i++ {
 		if err := q.Enqueue(&item2{i}); err != nil {
 			t.Fatal("Error enqueueing", err)
 		}
 	}
 
-	// Check the Size calculation
 	assert(t, 9 == q.Size(), "the size is calculated wrong.  Should be 9")
 
 	firstSegNum, lastSegNum := q.SegmentNumbers()
-
-	// Assert that the first segment is #1
 	assert(t, 1 == firstSegNum, "the first segment is not 1")
-
-	// Assert that the last segment is #4
 	assert(t, 3 == lastSegNum, "the last segment is not 3")
 
-	// Dequeue 8 items
 	for i := 0; i < 8; i++ {
 		iface, err := q.Dequeue()
 		if err != nil {
 			t.Fatal("Error dequeueing:", err)
 		}
-
-		// Check the Size calculation
 		assert(t, 8-i == q.Size(), "the size is calculated wrong.")
 		item, ok := iface.(item2)
 		if ok {
@@ -200,25 +164,17 @@ func testQueue_Add9Remove8(t *testing.T, turbo bool) {
 	}
 
 	firstSegNum, lastSegNum = q.SegmentNumbers()
-
-	// Assert that we have only one segment
 	assert(t, firstSegNum == lastSegNum, "The first segment must match the second")
-
-	// Assert that the first segment is #3
 	assert(t, 3 == firstSegNum, "The last segment is not 3")
 
-	// Now reopen the queue and check our assertions again.
 	q.Close()
 	_ = openQ(t, qName, turbo)
 
-	// Assert that we have more than one segment
 	assert(t, firstSegNum == lastSegNum, "After opening, the first segment must match the second")
-
-	// Assert that the last segment is #3
 	assert(t, 3 == lastSegNum, "After opening, the last segment is not 3")
 
 	if err := os.RemoveAll(qName); err != nil {
-		t.Fatal("Error cleaning up the queue directory:", err)
+		t.Fatal("Error removing queue directory for Add9Remove8:", err)
 	}
 }
 
@@ -226,17 +182,16 @@ func TestQueue_EmptyDequeue(t *testing.T) {
 	testQueue_EmptyDequeue(t, true /* true=turbo */)
 	testQueue_EmptyDequeue(t, false /* true=turbo */)
 }
+
 func testQueue_EmptyDequeue(t *testing.T, turbo bool) {
 	qName := "testEmptyDequeue"
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory:", err)
 	}
 
-	// Create new queue
 	q := newQ(t, qName, turbo)
 	assert(t, 0 == q.Size(), "Expected an empty queue")
 
-	// Dequeue an item from the empty queue
 	item, err := q.Dequeue()
 	assert(t, dque.ErrEmpty == err, "Expected an ErrEmpty error")
 	assert(t, item == nil, "Expected nil because queue is empty")
@@ -257,11 +212,9 @@ func testQueue_NewOrOpen(t *testing.T, turbo bool) {
 		t.Fatal("Error removing queue directory:", err)
 	}
 
-	// Create new queue with newOrOpen
 	q := newOrOpenQ(t, qName, turbo)
 	q.Close()
 
-	// Open the same queue with newOrOpen
 	q = newOrOpenQ(t, qName, turbo)
 	q.Close()
 
@@ -276,30 +229,24 @@ func TestQueue_Turbo(t *testing.T) {
 		t.Fatal("Error removing queue directory:", err)
 	}
 
-	// Create new queue
 	q := newQ(t, qName, false)
 
 	if err := q.TurboOff(); err == nil {
 		t.Fatal("Expected an error")
 	}
-
 	if err := q.TurboSync(); err == nil {
 		t.Fatal("Expected an error")
 	}
-
 	if err := q.TurboOn(); err != nil {
 		t.Fatal("Error turning on turbo:", err)
 	}
-
 	if err := q.TurboOn(); err == nil {
 		t.Fatal("Expected an error")
 	}
-
 	if err := q.TurboSync(); err != nil {
 		t.Fatal("Error running TurboSync:", err)
 	}
 
-	// Enqueue 1000 items
 	start := time.Now()
 	for i := 0; i < 1000; i++ {
 		if err := q.Enqueue(&item2{i}); err != nil {
@@ -309,12 +256,10 @@ func TestQueue_Turbo(t *testing.T) {
 	elapsedTurbo := time.Since(start)
 
 	assert(t, q.Turbo(), "Expected turbo to be on")
-
 	if err := q.TurboOff(); err != nil {
 		t.Fatal("Error turning off turbo:", err)
 	}
 
-	// Enqueue 1000 items
 	start = time.Now()
 	for i := 0; i < 1000; i++ {
 		if err := q.Enqueue(&item2{i}); err != nil {
@@ -336,13 +281,11 @@ func TestQueue_NewFlock(t *testing.T) {
 		t.Fatal("Error cleaning up the queue directory:", err)
 	}
 
-	// New and Close a DQue properly should work
 	q, err := dque.New(qName, ".", 3, item2Builder)
 	if err != nil {
 		t.Fatal("Error creating dque:", err)
 	}
-	err = q.Close()
-	if err != nil {
+	if err = q.Close(); err != nil {
 		t.Fatal("Error closing dque:", err)
 	}
 
@@ -355,8 +298,7 @@ func TestQueue_NewFlock(t *testing.T) {
 	if err == nil {
 		t.Fatal("No error during double-open dque")
 	}
-	err = q.Close()
-	if err != nil {
+	if err = q.Close(); err != nil {
 		t.Fatal("Error closing dque:", err)
 	}
 
@@ -365,16 +307,13 @@ func TestQueue_NewFlock(t *testing.T) {
 	if err != nil {
 		t.Fatal("Error opening dque:", err)
 	}
-	err = q.Close()
-	if err != nil {
+	if err = q.Close(); err != nil {
 		t.Fatal("Error closing dque:", err)
 	}
-	err = q.Close()
-	if err == nil {
+	if err = q.Close(); err == nil {
 		t.Fatal("No error during double-closing dque")
 	}
 
-	// Cleanup
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory:", err)
 	}
@@ -390,45 +329,39 @@ func TestQueue_UseAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatal("Error creating dque:", err)
 	}
-	err = q.Enqueue(&item2{0})
-	if err != nil {
+	if err = q.Enqueue(&item2{0}); err != nil {
 		t.Fatal("Error enqueing item:", err)
 	}
-	err = q.Close()
-	if err != nil {
+	if err = q.Close(); err != nil {
 		t.Fatal("Error closing dque:", err)
 	}
 
-	queueClosedError := "queue is closed"
+	const queueClosedError = "queue is closed"
 
 	err = q.Close()
-	assert(t, err.Error() == queueClosedError, "Expected error not found", err)
+	assert(t, err.Error() == queueClosedError, "Expected error not found: %v", err)
 
 	err = q.Enqueue(&item2{0})
-	assert(t, err.Error() == queueClosedError, "Expected error not found", err)
+	assert(t, err.Error() == queueClosedError, "Expected error not found: %v", err)
 
 	_, err = q.Dequeue()
-	assert(t, err.Error() == queueClosedError, "Expected error not found", err)
+	assert(t, err.Error() == queueClosedError, "Expected error not found: %v", err)
 
 	_, err = q.Peek()
-	assert(t, err.Error() == queueClosedError, "Expected error not found", err)
+	assert(t, err.Error() == queueClosedError, "Expected error not found: %v", err)
 
 	s := q.Size()
-	assert(t, s == 0, "Expected error")
-
+	assert(t, s == 0, "Expected 0 size")
 	s = q.SizeUnsafe()
-	assert(t, s == 0, "Expected error")
+	assert(t, s == 0, "Expected 0 size")
 
 	err = q.TurboOn()
-	assert(t, err.Error() == queueClosedError, "Expected error not found", err)
-
+	assert(t, err.Error() == queueClosedError, "Expected error not found: %v", err)
 	err = q.TurboOff()
-	assert(t, err.Error() == queueClosedError, "Expected error not found", err)
-
+	assert(t, err.Error() == queueClosedError, "Expected error not found: %v", err)
 	err = q.TurboSync()
-	assert(t, err.Error() == queueClosedError, "Expected error not found", err)
+	assert(t, err.Error() == queueClosedError, "Expected error not found: %v", err)
 
-	// Cleanup
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory:", err)
 	}
@@ -443,8 +376,7 @@ func TestQueue_BlockingBehaviour(t *testing.T) {
 	q := newQ(t, qName, false)
 
 	go func() {
-		err := q.Enqueue(&item2{0})
-		assert(t, err == nil, "Expected no error")
+		assert(t, q.Enqueue(&item2{0}) == nil, "Expected no error")
 	}()
 
 	x, err := q.PeekBlock()
@@ -455,8 +387,8 @@ func TestQueue_BlockingBehaviour(t *testing.T) {
 	assert(t, err == nil, "Expected no error")
 	assert(t, x != nil, "Item is nil")
 
-	x, err = q.Dequeue()
-	assert(t, err == dque.ErrEmpty, "Expected error not found")
+	_, err = q.Dequeue()
+	assert(t, err == dque.ErrEmpty, "Expected ErrEmpty error")
 
 	timeout := time.After(3 * time.Second)
 	done := make(chan bool)
@@ -466,11 +398,9 @@ func TestQueue_BlockingBehaviour(t *testing.T) {
 		assert(t, x != nil, "Item is nil")
 		done <- true
 	}()
-
 	go func() {
 		time.Sleep(1 * time.Second)
-		err := q.Enqueue(&item2{2})
-		assert(t, err == nil, "Expected no error")
+		assert(t, q.Enqueue(&item2{2}) == nil, "Expected no error")
 	}()
 
 	select {
@@ -479,7 +409,6 @@ func TestQueue_BlockingBehaviour(t *testing.T) {
 	case <-done:
 	}
 
-	// Cleanup
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory:", err)
 	}
@@ -495,18 +424,12 @@ func TestQueue_BlockingWithClose(t *testing.T) {
 
 	go func() {
 		time.Sleep(1 * time.Second)
-		err := q.Close()
-		assert(t, err == nil, "Expected no error")
+		assert(t, q.Close() == nil, "Expected no error")
 	}()
 
 	timeout := time.After(3 * time.Second)
 	done := make(chan bool)
 	go func() {
-		// The queue is empty,
-		// so DequeueBlock should really block and wait,
-		// until the other goroutine calls Close,
-		// and the Close should wake-up this DequeueBlock block,
-		// and return an error because the queue is now closed.
 		_, err := q.DequeueBlock()
 		assert(t, err == dque.ErrQueueClosed, "Expected ErrQueueClosed error")
 		done <- true
@@ -518,25 +441,23 @@ func TestQueue_BlockingWithClose(t *testing.T) {
 	case <-done:
 	}
 
-	// Cleanup
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory:", err)
 	}
 }
 
-func TestQueue_BlockingAggresive(t *testing.T) {
-	rand.Seed(0) // ensure we have reproducible sleeps
+func TestQueue_BlockingAggressive(t *testing.T) {
 
-	qName := "testBlockingAggresive"
+	qName := "testBlockingAggressive"
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory:", err)
 	}
 
 	q := newQ(t, qName, false)
 
-	numProducers := 5
-	numItemsPerProducer := 50
-	numConsumers := 25
+	const numProducers = 5
+	const numItemsPerProducer = 50
+	const numConsumers = 25
 
 	done := make(chan bool)
 	var wg sync.WaitGroup
@@ -548,20 +469,18 @@ func TestQueue_BlockingAggresive(t *testing.T) {
 		done <- true
 	}()
 
-	// producers
 	for p := 0; p < numProducers; p++ {
 		go func(producer int) {
+			rng := rand.New(rand.NewSource(int64(producer)))
 			for i := 0; i < numItemsPerProducer; i++ {
-				s := rand.Intn(150)
+				s := rng.Intn(150)
 				time.Sleep(time.Duration(s) * time.Millisecond)
-				err := q.Enqueue(&item2{i})
-				assert(t, err == nil, "Expected no error", err)
+				assert(t, q.Enqueue(&item2{i}) == nil, "Expected no error")
 				fmt.Println("Enqueued item", i, "by producer", producer, "after sleeping", s)
 			}
 		}(p)
 	}
 
-	// consumers
 	for c := 0; c < numConsumers; c++ {
 		go func(consumer int) {
 			for {
@@ -583,19 +502,55 @@ func TestQueue_BlockingAggresive(t *testing.T) {
 	case <-done:
 	}
 
-	// Cleanup
 	if err := os.RemoveAll(qName); err != nil {
 		t.Fatal("Error removing queue directory:", err)
 	}
 }
 
+// TestQueue_WithCodecRoundtrip verifies that NewOrOpenWithCodec preserves data across close/reopen.
+func TestQueue_WithCodecRoundtrip(t *testing.T) {
+	qName := "testWithCodecRoundtrip"
+	if err := os.RemoveAll(qName); err != nil {
+		t.Fatal("Error removing queue directory:", err)
+	}
+	defer os.RemoveAll(qName)
+
+	const numItems = 15
+
+	q, err := dque.NewOrOpenWithCodec(qName, ".", 5, item2Builder, dque.GobCodec{})
+	if err != nil {
+		t.Fatal("Error creating queue:", err)
+	}
+	for i := 0; i < numItems; i++ {
+		if enqErr := q.Enqueue(&item2{i}); enqErr != nil {
+			t.Fatalf("Enqueue[%d] failed: %s", i, enqErr)
+		}
+	}
+	assert(t, q.Size() == numItems, "Size mismatch after enqueue: got %d want %d", q.Size(), numItems)
+	q.Close()
+
+	// Reopen with same codec and verify all items come back in order.
+	q2, err := dque.NewOrOpenWithCodec(qName, ".", 5, item2Builder, dque.GobCodec{})
+	if err != nil {
+		t.Fatal("Error reopening queue:", err)
+	}
+	for i := 0; i < numItems; i++ {
+		raw, deqErr := q2.Dequeue()
+		if deqErr != nil {
+			t.Fatalf("Dequeue[%d] failed: %s", i, deqErr)
+		}
+		got, ok := raw.(*item2)
+		assert(t, ok, "Dequeued object is not *item2 at index %d", i)
+		assert(t, got.Id == i, "item[%d] Id mismatch: got %d want %d", i, got.Id, i)
+	}
+	q2.Close()
+}
+
 func newOrOpenQ(t *testing.T, qName string, turbo bool) *dque.DQue {
-	// Create a new segment with segment size of 3
 	q, err := dque.NewOrOpen(qName, ".", 3, item2Builder)
 	if err != nil {
 		t.Fatal("Error creating or opening dque:", err)
 	}
-
 	if turbo {
 		_ = q.TurboOn()
 	}
@@ -603,7 +558,6 @@ func newOrOpenQ(t *testing.T, qName string, turbo bool) *dque.DQue {
 }
 
 func newQ(t *testing.T, qName string, turbo bool) *dque.DQue {
-	// Create a new segment with segment size of 3
 	q, err := dque.New(qName, ".", 3, item2Builder)
 	if err != nil {
 		t.Fatal("Error creating new dque:", err)
@@ -615,7 +569,6 @@ func newQ(t *testing.T, qName string, turbo bool) *dque.DQue {
 }
 
 func openQ(t *testing.T, qName string, turbo bool) *dque.DQue {
-	// Open an existing segment with segment size of 3
 	q, err := dque.Open(qName, ".", 3, item2Builder)
 	if err != nil {
 		t.Fatal("Error opening dque:", err)

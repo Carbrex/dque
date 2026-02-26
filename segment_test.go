@@ -1,8 +1,8 @@
-// segement_test.go
+// segment_test.go
 package dque
 
 //
-// White box texting of the aSegment struct and methods.
+// White box testing of the qSegment struct and methods.
 //
 
 import (
@@ -24,7 +24,7 @@ func item1Builder() interface{} {
 	return &item1{}
 }
 
-// Test_segment verifies the behavior of one segment.
+// TestSegment verifies the behavior of one segment.
 func TestSegment(t *testing.T) {
 	testDir := "./TestSegment"
 	os.RemoveAll(testDir)
@@ -33,7 +33,7 @@ func TestSegment(t *testing.T) {
 	}
 
 	// Create a new segment of the queue
-	seg, err := newQueueSegment(testDir, 1, false, item1Builder)
+	seg, err := newQueueSegment(testDir, 1, false, item1Builder, GobCodec{})
 	if err != nil {
 		t.Fatalf("newQueueSegment('%s') failed with '%s'\n", testDir, err.Error())
 	}
@@ -63,7 +63,7 @@ func TestSegment(t *testing.T) {
 	//
 	// Recreate the segment from disk and remove the remaining item
 	//
-	seg, err = openQueueSegment(testDir, 1, false, item1Builder)
+	seg, err = openQueueSegment(testDir, 1, false, item1Builder, GobCodec{})
 	if err != nil {
 		t.Fatalf("openQueueSegment('%s') failed with '%s'\n", testDir, err.Error())
 	}
@@ -87,7 +87,7 @@ func TestSegment(t *testing.T) {
 func TestSegment_ErrCorruptedSegment(t *testing.T) {
 	testDir := "./TestSegmentError"
 	os.RemoveAll(testDir)
-	defer os.RemoveAll((testDir))
+	defer os.RemoveAll(testDir)
 
 	if err := os.Mkdir(testDir, 0755); err != nil {
 		t.Fatalf("Error creating directory in the TestSegment_ErrCorruptedSegment method: %s\n", err)
@@ -98,21 +98,16 @@ func TestSegment_ErrCorruptedSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// expect an 8 byte object, but only write 7 bytes
+	// expect an 8-byte object payload, but only write 7 bytes
 	if _, err := f.Write([]byte{0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7}); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()
 
-	_, err = openQueueSegment(testDir, 0, false, func() interface{} { return make([]byte, 8) })
+	_, err = openQueueSegment(testDir, 0, false, func() interface{} { return make([]byte, 8) }, GobCodec{})
 	if err == nil {
 		t.Fatal("expected ErrCorruptedSegment but got nil")
 	}
-	// // go >= 1.13:
-	// var corruptedError ErrCorruptedSegment
-	// if !errors.As(err, &corruptedError) {
-	// 	t.Fatalf("expected ErrCorruptedSegment but got %T: %s", err, err)
-	// }
 	corruptedError, ok := unwrapError(unwrapError(err)).(ErrCorruptedSegment)
 	if !ok {
 		t.Fatalf("expected ErrCorruptedSegment but got %T: %s", err, err)
@@ -120,8 +115,9 @@ func TestSegment_ErrCorruptedSegment(t *testing.T) {
 	if corruptedError.Path != "TestSegmentError/0000000000000.dque" {
 		t.Fatalf("unexpected file path: %s", corruptedError.Path)
 	}
-	if corruptedError.Error() != "segment file TestSegmentError/0000000000000.dque is corrupted: error reading gob data from file: unexpected EOF" {
-		t.Fatalf("wrong error message: %s", corruptedError.Error())
+	const wantMsg = "segment file TestSegmentError/0000000000000.dque is corrupted: error reading payload from file: unexpected EOF"
+	if corruptedError.Error() != wantMsg {
+		t.Fatalf("wrong error message:\ngot:  %s\nwant: %s", corruptedError.Error(), wantMsg)
 	}
 }
 
@@ -129,7 +125,7 @@ func unwrapError(err error) error {
 	return err.(interface{ Unwrap() error }).Unwrap()
 }
 
-// TestSegment_Open verifies the behavior of the openSegment function.
+// TestSegment_openQueueSegment_failIfNew verifies that openQueueSegment fails for a new (non-existent) file.
 func TestSegment_openQueueSegment_failIfNew(t *testing.T) {
 	testDir := "./TestSegment_Open"
 	os.RemoveAll(testDir)
@@ -137,13 +133,12 @@ func TestSegment_openQueueSegment_failIfNew(t *testing.T) {
 		t.Fatalf("Error creating directory in the TestSegment_Open method: %s\n", err)
 	}
 
-	seg, err := openQueueSegment(testDir, 1, false, item1Builder)
+	seg, err := openQueueSegment(testDir, 1, false, item1Builder, GobCodec{})
 	if err == nil {
 		t.Fatalf("openQueueSegment('%s') should have failed because it should be new\n", testDir)
 	}
 	assert(t, seg == nil, "segment after failure must be nil")
 
-	// Cleanup
 	if err := os.RemoveAll(testDir); err != nil {
 		t.Fatalf("Error cleaning up directory from the TestSegment_Open method with '%s'\n", err.Error())
 	}
@@ -157,7 +152,7 @@ func TestSegment_Turbo(t *testing.T) {
 		t.Fatalf("Error creating directory in the TestSegment_Turbo method: %s\n", err)
 	}
 
-	seg, err := newQueueSegment(testDir, 10, false, item1Builder)
+	seg, err := newQueueSegment(testDir, 10, false, item1Builder, GobCodec{})
 	if err != nil {
 		t.Fatalf("newQueueSegment('%s') failed\n", testDir)
 	}
@@ -175,7 +170,7 @@ func TestSegment_Turbo(t *testing.T) {
 
 	// Turn off turbo and expect the syncCount to increase when remove is called.
 	if err = seg.turboOff(); err != nil {
-		t.Fatalf("Unexpecte error turning off turbo('%s')\n", testDir)
+		t.Fatalf("Unexpected error turning off turbo('%s')\n", testDir)
 	}
 
 	// seg.turboOff() calls seg.turboSync() which increments syncCount
@@ -188,9 +183,56 @@ func TestSegment_Turbo(t *testing.T) {
 	// seg.remove() calls seg._sync() which increments syncCount
 	assert(t, 3 == seg.syncCount, "syncCount must be 3 now")
 
-	// Cleanup
 	if err := os.RemoveAll(testDir); err != nil {
 		t.Fatalf("Error cleaning up directory from the TestSegment_Open method with '%s'\n", err.Error())
+	}
+}
+
+// TestSegment_CodecRoundtrip verifies that add()/load() round-trip through the codec correctly.
+func TestSegment_CodecRoundtrip(t *testing.T) {
+	testDir := "./TestSegmentCodecRoundtrip"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+	if err := os.Mkdir(testDir, 0755); err != nil {
+		t.Fatalf("mkdir failed: %s", err)
+	}
+
+	items := []*item1{
+		{Name: "alpha"},
+		{Name: "beta"},
+		{Name: "gamma with spaces"},
+	}
+
+	// Write items using GobCodec
+	seg, err := newQueueSegment(testDir, 1, false, item1Builder, GobCodec{})
+	if err != nil {
+		t.Fatalf("newQueueSegment: %s", err)
+	}
+	for _, it := range items {
+		if addErr := seg.add(it); addErr != nil {
+			t.Fatalf("add failed: %s", addErr)
+		}
+	}
+	if closeErr := seg.close(); closeErr != nil {
+		t.Fatalf("close failed: %s", closeErr)
+	}
+
+	// Re-open and verify all items round-tripped correctly
+	seg2, err := openQueueSegment(testDir, 1, false, item1Builder, GobCodec{})
+	if err != nil {
+		t.Fatalf("openQueueSegment: %s", err)
+	}
+	assert(t, seg2.size() == len(items), "size mismatch after reload: got %d want %d", seg2.size(), len(items))
+
+	for i, want := range items {
+		obj, removeErr := seg2.remove()
+		if removeErr != nil {
+			t.Fatalf("remove[%d] failed: %s", i, removeErr)
+		}
+		got, ok := obj.(*item1)
+		assert(t, ok, "decoded object is not *item1 at index %d", i)
+		assert(t, got.Name == want.Name,
+			"item[%d] name mismatch: got %q want %q", i, got.Name, want.Name)
 	}
 }
 

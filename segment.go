@@ -16,9 +16,7 @@ package dque
 //
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"os"
@@ -65,6 +63,15 @@ var (
 	errEmptySegment = errors.New("Segment is empty")
 )
 
+// segWritePool holds reusable byte slice pointers for the add() write path.
+// Each entry is *[]byte so the pool can grow the backing array on reallocations.
+var segWritePool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 0, 1024)
+		return &buf
+	},
+}
+
 // qSegment represents a portion (segment) of a persistent queue
 type qSegment struct {
 	dirPath       string
@@ -77,10 +84,11 @@ type qSegment struct {
 	turbo         bool
 	maybeDirty    bool  // filesystem changes may not have been flushed to disk
 	syncCount     int64 // for testing
+	codec         Codec
 }
 
-// load reads all objects from the queue file into a slice
-// returns ErrCorruptedSegment or ErrUnableToDecode for errors pertaining to file contents.
+// load reads all objects from the queue file into a slice.
+// Returns ErrCorruptedSegment or ErrUnableToDecode for errors pertaining to file contents.
 func (seg *qSegment) load() error {
 
 	// This is heavy-handed but its safe
@@ -97,7 +105,7 @@ func (seg *qSegment) load() error {
 
 	// Loop until we can load no more
 	for {
-		// Read the 4 byte length of the gob
+		// Read the 4-byte length prefix
 		lenBytes := make([]byte, 4)
 		if n, err := io.ReadFull(seg.file, lenBytes); err != nil {
 			if err == io.EOF {
@@ -110,9 +118,9 @@ func (seg *qSegment) load() error {
 		}
 
 		// Convert the bytes into a 32-bit unsigned int
-		gobLen := binary.LittleEndian.Uint32(lenBytes)
-		if gobLen == 0 {
-			// Remove the first item from the in-memory queue
+		payloadLen := binary.LittleEndian.Uint32(lenBytes)
+		if payloadLen == 0 {
+			// A zero-length prefix is a tombstone marking a consumed item.
 			if len(seg.objects) == 0 {
 				return ErrCorruptedSegment{
 					Path: seg.filePath(),
@@ -120,32 +128,28 @@ func (seg *qSegment) load() error {
 				}
 			}
 			seg.objects = seg.objects[1:]
-			// log.Println("TEMP: Detected delete in load()")
 			seg.removeCount++
 			continue
 		}
 
-		data := make([]byte, int(gobLen))
+		data := make([]byte, int(payloadLen))
 		if _, err := io.ReadFull(seg.file, data); err != nil {
 			return ErrCorruptedSegment{
 				Path: seg.filePath(),
-				Err:  errors.Wrap(err, "error reading gob data from file"),
+				Err:  errors.Wrap(err, "error reading payload from file"),
 			}
 		}
 
-		// Decode the bytes into an object
-		object := seg.objectBuilder()
-		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(object); err != nil {
+		// Decode the bytes into an object using the configured codec
+		object, decErr := seg.codec.Decode(data, seg.objectBuilder)
+		if decErr != nil {
 			return ErrUnableToDecode{
 				Path: seg.filePath(),
-				Err:  errors.Wrapf(err, "failed to decode %T", object),
+				Err:  errors.Wrapf(decErr, "failed to decode object"),
 			}
 		}
 
-		// Add item to the objects slice
 		seg.objects = append(seg.objects, object)
-
-		// log.Printf("TEMP: Loaded: %#v\n", object)
 	}
 }
 
@@ -158,18 +162,14 @@ func (seg *qSegment) peek() (interface{}, error) {
 	defer seg.mutex.Unlock()
 
 	if len(seg.objects) == 0 {
-		// Queue is empty so return nil object (and emptySegment error)
 		return nil, errEmptySegment
 	}
 
-	// Save a reference to the first item in the in-memory queue
-	object := seg.objects[0]
-
-	return object, nil
+	return seg.objects[0], nil
 }
 
-// remove removes and returns the first item in the segment and adds
-// a zero length marker to the end of the queue file to signify a removal.
+// remove removes and returns the first item in the segment and appends
+// a zero-length marker to the queue file to record the removal.
 // If the queue is already empty, the emptySegment error will be returned.
 func (seg *qSegment) remove() (interface{}, error) {
 
@@ -178,30 +178,21 @@ func (seg *qSegment) remove() (interface{}, error) {
 	defer seg.mutex.Unlock()
 
 	if len(seg.objects) == 0 {
-		// Queue is empty so return nil object (and empty_segment error)
 		return nil, errEmptySegment
 	}
 
-	// Create a 4-byte length of value zero (this signifies a removal)
-	deleteLen := 0
+	// A 4-byte zero is the tombstone that records a removal without rewriting the file.
 	deleteLenBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(deleteLenBytes, uint32(deleteLen))
+	binary.LittleEndian.PutUint32(deleteLenBytes, 0)
 
-	// Write the 4-byte length (of zero) first
 	if _, err := seg.file.Write(deleteLenBytes); err != nil {
 		return nil, errors.Wrapf(err, "failed to remove item from segment %d", seg.number)
 	}
 
-	// Save a reference to the first item in the in-memory queue
 	object := seg.objects[0]
-
-	// Remove the first item from the in-memory queue
 	seg.objects = seg.objects[1:]
-
-	// Increment the delete count
 	seg.removeCount++
 
-	// Possibly force writes to disk
 	if err := seg._sync(); err != nil {
 		return nil, err
 	}
@@ -209,39 +200,43 @@ func (seg *qSegment) remove() (interface{}, error) {
 	return object, nil
 }
 
-// Add adds an item to the in-memory queue segment and appends it to the persistent file
+// add adds an item to the in-memory queue segment and appends it to the persistent file.
+// The 4-byte length prefix and encoded payload are written in a single syscall using a
+// pooled buffer to avoid a per-call heap allocation.
 func (seg *qSegment) add(object interface{}) error {
 
 	// This is heavy-handed but its safe
 	seg.mutex.Lock()
 	defer seg.mutex.Unlock()
 
-	// Encode the struct to a byte buffer
-	var buff bytes.Buffer
-	enc := gob.NewEncoder(&buff)
-	if err := enc.Encode(object); err != nil {
-		return errors.Wrap(err, "error gob encoding object")
+	// Grab a reusable buffer. Reserve the first 4 bytes as a length placeholder so
+	// the codec can append the encoded bytes after it with no extra copy.
+	bp := segWritePool.Get().(*[]byte)
+	*bp = (*bp)[:0]
+	*bp = append(*bp, 0, 0, 0, 0) // length placeholder
+
+	result, encErr := seg.codec.Encode(*bp, object)
+	if encErr != nil {
+		segWritePool.Put(bp)
+		return errors.Wrap(encErr, "error encoding object")
 	}
+	// result = [placeholder(4)] + [encoded payload]
+	payloadLen := len(result) - 4
+	binary.LittleEndian.PutUint32(result[:4], uint32(payloadLen))
 
-	// Count the bytes stored in the byte buffer
-	// and store the count into a 4-byte byte array
-	buffLen := len(buff.Bytes())
-	buffLenBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buffLenBytes, uint32(buffLen))
+	// Single syscall: length prefix and payload combined.
+	_, writeErr := seg.file.Write(result)
 
-	// Write the 4-byte buffer length first
-	if _, err := seg.file.Write(buffLenBytes); err != nil {
-		return errors.Wrapf(err, "failed to write object length to segment %d", seg.number)
-	}
+	// Return the (possibly grown) backing array before checking the error.
+	*bp = result[:0]
+	segWritePool.Put(bp)
 
-	// Then write the buffer bytes
-	if _, err := seg.file.Write(buff.Bytes()); err != nil {
-		return errors.Wrapf(err, "failed to write object to segment %d", seg.number)
+	if writeErr != nil {
+		return errors.Wrapf(writeErr, "failed to write object to segment %d", seg.number)
 	}
 
 	seg.objects = append(seg.objects, object)
 
-	// Possibly force writes to disk
 	return seg._sync()
 }
 
@@ -280,15 +275,11 @@ func (seg *qSegment) delete() error {
 		return errors.Wrap(err, "unable to close the segment file before deleting")
 	}
 
-	// Delete the storage for this queue
-	err := os.Remove(seg.filePath())
-	if err != nil {
+	if err := os.Remove(seg.filePath()); err != nil {
 		return errors.Wrap(err, "error deleting file: "+seg.filePath())
 	}
 
-	// Empty the in-memory slice of objects
 	seg.objects = seg.objects[:0]
-
 	seg.file = nil
 
 	return nil
@@ -302,8 +293,8 @@ func (seg *qSegment) filePath() string {
 	return path.Join(seg.dirPath, seg.fileName())
 }
 
-// turboOn allows the filesystem to decide when to sync file changes to disk
-// Speed is be greatly increased by turning turbo on, however there is some
+// turboOn allows the filesystem to decide when to sync file changes to disk.
+// Speed is greatly increased by turning turbo on, however there is some
 // risk of losing data should a power-loss occur.
 func (seg *qSegment) turboOn() {
 	seg.turbo = true
@@ -313,7 +304,7 @@ func (seg *qSegment) turboOn() {
 // they happen.
 func (seg *qSegment) turboOff() error {
 	if !seg.turbo {
-		// turboOff is know to be called twice when the first and last ssegments
+		// turboOff is known to be called twice when the first and last segments
 		// are the same.
 		return nil
 	}
@@ -327,8 +318,6 @@ func (seg *qSegment) turboOff() error {
 // turboSync does an fsync to disk if turbo is on.
 func (seg *qSegment) turboSync() error {
 	if !seg.turbo {
-		// When the first and last segments are the same, this method
-		// will be called twice.
 		return nil
 	}
 	if seg.maybeDirty {
@@ -342,11 +331,9 @@ func (seg *qSegment) turboSync() error {
 }
 
 // _sync must only be called by the add and remove methods on qSegment.
-// Only syncs if turbo is off
+// Only syncs if turbo is off.
 func (seg *qSegment) _sync() error {
 	if seg.turbo {
-		// We do *not* force a sync if turbo is on
-		// We just mark it maybe dirty
 		seg.maybeDirty = true
 		return nil
 	}
@@ -363,18 +350,22 @@ func (seg *qSegment) _sync() error {
 // creating a new last segment.
 // This should only be called if this segment is not also the first segment.
 func (seg *qSegment) close() error {
-
 	if err := seg.file.Close(); err != nil {
 		return errors.Wrapf(err, "unable to close segment file %s.", seg.fileName())
 	}
-
 	return nil
 }
 
-// newQueueSegment creates a new, persistent  segment of the queue
-func newQueueSegment(dirPath string, number int, turbo bool, builder func() interface{}) (*qSegment, error) {
+// newQueueSegment creates a new, persistent segment of the queue.
+func newQueueSegment(dirPath string, number int, turbo bool, builder func() interface{}, codec Codec) (*qSegment, error) {
 
-	seg := qSegment{dirPath: dirPath, number: number, turbo: turbo, objectBuilder: builder}
+	seg := qSegment{
+		dirPath:       dirPath,
+		number:        number,
+		turbo:         turbo,
+		objectBuilder: builder,
+		codec:         codec,
+	}
 
 	if !dirExists(seg.dirPath) {
 		return nil, errors.New("dirPath is not a valid directory: " + seg.dirPath)
@@ -384,21 +375,25 @@ func newQueueSegment(dirPath string, number int, turbo bool, builder func() inte
 		return nil, errors.New("file already exists: " + seg.filePath())
 	}
 
-	// Create the file in append mode
 	var err error
 	seg.file, err = os.OpenFile(seg.filePath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error creating file: %s.", seg.filePath())
 	}
-	// Leave the file open for future writes
 
 	return &seg, nil
 }
 
-// openQueueSegment reads an existing persistent segment of the queue into memory
-func openQueueSegment(dirPath string, number int, turbo bool, builder func() interface{}) (*qSegment, error) {
+// openQueueSegment reads an existing persistent segment of the queue into memory.
+func openQueueSegment(dirPath string, number int, turbo bool, builder func() interface{}, codec Codec) (*qSegment, error) {
 
-	seg := qSegment{dirPath: dirPath, number: number, turbo: turbo, objectBuilder: builder}
+	seg := qSegment{
+		dirPath:       dirPath,
+		number:        number,
+		turbo:         turbo,
+		objectBuilder: builder,
+		codec:         codec,
+	}
 
 	if !dirExists(seg.dirPath) {
 		return nil, errors.New("dirPath is not a valid directory: " + seg.dirPath)
@@ -408,18 +403,15 @@ func openQueueSegment(dirPath string, number int, turbo bool, builder func() int
 		return nil, errors.New("file does not exist: " + seg.filePath())
 	}
 
-	// Load the items into memory
 	if err := seg.load(); err != nil {
 		return nil, errors.Wrap(err, "unable to load queue segment in "+dirPath)
 	}
 
-	// Re-open the file in append mode
 	var err error
 	seg.file, err = os.OpenFile(seg.filePath(), os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, errors.Wrap(err, "error opening file: "+seg.filePath())
 	}
-	// Leave the file open for future writes
 
 	return &seg, nil
 }

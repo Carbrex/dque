@@ -10,17 +10,15 @@ package dque
 //
 
 import (
+	"math"
+	"os"
+	"path"
+	"regexp"
 	"strconv"
 	"sync"
 
 	"github.com/gofrs/flock"
 	"github.com/pkg/errors"
-
-	"io/ioutil"
-	"math"
-	"os"
-	"path"
-	"regexp"
 )
 
 const lockFile = "lock.lock"
@@ -56,7 +54,8 @@ type DQue struct {
 	fileLock     *flock.Flock
 	firstSegment *qSegment
 	lastSegment  *qSegment
-	builder      func() interface{} // builds a structure to load via gob
+	builder      func() interface{}
+	codec        Codec
 
 	mutex sync.Mutex
 
@@ -65,10 +64,14 @@ type DQue struct {
 	turbo bool
 }
 
-// New creates a new durable queue
+// New creates a new durable queue using the default GobCodec.
 func New(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
+	return NewWithCodec(name, dirPath, itemsPerSegment, builder, GobCodec{})
+}
 
-	// Validation
+// NewWithCodec creates a new durable queue using the provided Codec.
+func NewWithCodec(name string, dirPath string, itemsPerSegment int, builder func() interface{}, codec Codec) (*DQue, error) {
+
 	if len(name) == 0 {
 		return nil, errors.New("the queue name requires a value")
 	}
@@ -91,6 +94,7 @@ func New(name string, dirPath string, itemsPerSegment int, builder func() interf
 	q.fullPath = fullPath
 	q.config.ItemsPerSegment = itemsPerSegment
 	q.builder = builder
+	q.codec = codec
 	q.emptyCond = sync.NewCond(&q.mutex)
 
 	if err := q.lock(); err != nil {
@@ -98,8 +102,7 @@ func New(name string, dirPath string, itemsPerSegment int, builder func() interf
 	}
 
 	if err := q.load(); err != nil {
-		er := q.fileLock.Unlock()
-		if er != nil {
+		if er := q.fileLock.Unlock(); er != nil {
 			return nil, er
 		}
 		return nil, err
@@ -108,10 +111,14 @@ func New(name string, dirPath string, itemsPerSegment int, builder func() interf
 	return &q, nil
 }
 
-// Open opens an existing durable queue.
+// Open opens an existing durable queue using the default GobCodec.
 func Open(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
+	return OpenWithCodec(name, dirPath, itemsPerSegment, builder, GobCodec{})
+}
 
-	// Validation
+// OpenWithCodec opens an existing durable queue using the provided Codec.
+func OpenWithCodec(name string, dirPath string, itemsPerSegment int, builder func() interface{}, codec Codec) (*DQue, error) {
+
 	if len(name) == 0 {
 		return nil, errors.New("the queue name requires a value")
 	}
@@ -130,6 +137,7 @@ func Open(name string, dirPath string, itemsPerSegment int, builder func() inter
 	q.fullPath = fullPath
 	q.config.ItemsPerSegment = itemsPerSegment
 	q.builder = builder
+	q.codec = codec
 	q.emptyCond = sync.NewCond(&q.mutex)
 
 	if err := q.lock(); err != nil {
@@ -137,8 +145,7 @@ func Open(name string, dirPath string, itemsPerSegment int, builder func() inter
 	}
 
 	if err := q.load(); err != nil {
-		er := q.fileLock.Unlock()
-		if er != nil {
+		if er := q.fileLock.Unlock(); er != nil {
 			return nil, er
 		}
 		return nil, err
@@ -147,10 +154,14 @@ func Open(name string, dirPath string, itemsPerSegment int, builder func() inter
 	return &q, nil
 }
 
-// NewOrOpen either creates a new queue or opens an existing durable queue.
+// NewOrOpen either creates a new queue or opens an existing durable queue using the default GobCodec.
 func NewOrOpen(name string, dirPath string, itemsPerSegment int, builder func() interface{}) (*DQue, error) {
+	return NewOrOpenWithCodec(name, dirPath, itemsPerSegment, builder, GobCodec{})
+}
 
-	// Validation
+// NewOrOpenWithCodec either creates a new queue or opens an existing durable queue using the provided Codec.
+func NewOrOpenWithCodec(name string, dirPath string, itemsPerSegment int, builder func() interface{}, codec Codec) (*DQue, error) {
+
 	if len(name) == 0 {
 		return nil, errors.New("the queue name requires a value")
 	}
@@ -162,16 +173,15 @@ func NewOrOpen(name string, dirPath string, itemsPerSegment int, builder func() 
 	}
 	fullPath := path.Join(dirPath, name)
 	if dirExists(fullPath) {
-		return Open(name, dirPath, itemsPerSegment, builder)
+		return OpenWithCodec(name, dirPath, itemsPerSegment, builder, codec)
 	}
 
-	return New(name, dirPath, itemsPerSegment, builder)
+	return NewWithCodec(name, dirPath, itemsPerSegment, builder, codec)
 }
 
 // Close releases the lock on the queue rendering it unusable for further usage by this instance.
 // Close will return an error if it has already been called.
 func (q *DQue) Close() error {
-	// only allow Close while no other function is active
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -184,23 +194,11 @@ func (q *DQue) Close() error {
 		return err
 	}
 
-	// Finally mark this instance as closed to prevent any further access
 	q.fileLock = nil
 
 	// Wake-up any waiting goroutines for blocking queue access - they should get a ErrQueueClosed
 	q.emptyCond.Broadcast()
 
-	// Close the first and last segments' file handles
-	if err = q.firstSegment.close(); err != nil {
-		return err
-	}
-	if q.firstSegment != q.lastSegment {
-		if err = q.lastSegment.close(); err != nil {
-			return err
-		}
-	}
-
-	// Safe-guard ourself from accidentally using segments after closing the queue
 	q.firstSegment = nil
 	q.lastSegment = nil
 
@@ -209,7 +207,6 @@ func (q *DQue) Close() error {
 
 // Enqueue adds an item to the end of the queue
 func (q *DQue) Enqueue(obj interface{}) error {
-	// This is heavy-handed but its safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -220,32 +217,24 @@ func (q *DQue) Enqueue(obj interface{}) error {
 	// If this segment is full then create a new one
 	if q.lastSegment.sizeOnDisk() >= q.config.ItemsPerSegment {
 
-		// We have filled our last segment to capacity, so create a new one
-		seg, err := newQueueSegment(q.fullPath, q.lastSegment.number+1, q.turbo, q.builder)
+		seg, err := newQueueSegment(q.fullPath, q.lastSegment.number+1, q.turbo, q.builder, q.codec)
 		if err != nil {
 			return errors.Wrapf(err, "error creating new queue segment: %d.", q.lastSegment.number+1)
 		}
 
-		// If the last segment is not the first segment
-		// then we need to close the file.
 		if q.firstSegment != q.lastSegment {
-			var err = q.lastSegment.close()
-			if err != nil {
+			if err := q.lastSegment.close(); err != nil {
 				return errors.Wrapf(err, "error closing previous segment file #%d.", q.lastSegment.number)
 			}
 		}
 
-		// Replace the last segment with the new one
 		q.lastSegment = seg
-
 	}
 
-	// Add the object to the last segment
 	if err := q.lastSegment.add(obj); err != nil {
 		return errors.Wrap(err, "error adding item to the last segment")
 	}
 
-	// Wakeup any goroutine that is currently waiting for an item to be enqueued
 	q.emptyCond.Broadcast()
 
 	return nil
@@ -254,7 +243,6 @@ func (q *DQue) Enqueue(obj interface{}) error {
 // Dequeue removes and returns the first item in the queue.
 // When the queue is empty, nil and dque.ErrEmpty are returned.
 func (q *DQue) Dequeue() (interface{}, error) {
-	// This is heavy-handed but its safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -266,7 +254,6 @@ func (q *DQue) dequeueLocked() (interface{}, error) {
 		return nil, ErrQueueClosed
 	}
 
-	// Remove the first object from the first segment
 	obj, err := q.firstSegment.remove()
 	if err == errEmptySegment {
 		return nil, ErrEmpty
@@ -275,22 +262,16 @@ func (q *DQue) dequeueLocked() (interface{}, error) {
 		return nil, errors.Wrap(err, "error removing item from the first segment")
 	}
 
-	// If this segment is empty and we've reached the max for this segment
-	// then delete the file and open the next one.
 	if q.firstSegment.size() == 0 &&
 		q.firstSegment.sizeOnDisk() >= q.config.ItemsPerSegment {
 
-		// Delete the segment file
 		if err := q.firstSegment.delete(); err != nil {
 			return obj, errors.Wrap(err, "error deleting queue segment "+q.firstSegment.filePath()+". Queue is in an inconsistent state")
 		}
 
-		// We have only one segment and it's now empty so destroy it and
-		// create a new one.
 		if q.firstSegment.number == q.lastSegment.number {
 
-			// Create the next segment
-			seg, err := newQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.builder)
+			seg, err := newQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.builder, q.codec)
 			if err != nil {
 				return obj, errors.Wrap(err, "error creating new segment. Queue is in an inconsistent state")
 			}
@@ -300,12 +281,10 @@ func (q *DQue) dequeueLocked() (interface{}, error) {
 		} else {
 
 			if q.firstSegment.number+1 == q.lastSegment.number {
-				// We have 2 segments, moving down to 1 shared segment
 				q.firstSegment = q.lastSegment
 			} else {
 
-				// Open the next segment
-				seg, err := openQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.builder)
+				seg, err := openQueueSegment(q.fullPath, q.firstSegment.number+1, q.turbo, q.builder, q.codec)
 				if err != nil {
 					return obj, errors.Wrap(err, "error creating new segment. Queue is in an inconsistent state")
 				}
@@ -322,7 +301,6 @@ func (q *DQue) dequeueLocked() (interface{}, error) {
 // When the queue is empty, nil and dque.ErrEmpty are returned.
 // Do not use this method with multiple dequeueing threads or you may regret it.
 func (q *DQue) Peek() (interface{}, error) {
-	// This is heavy-handed but it is safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -334,13 +312,11 @@ func (q *DQue) peekLocked() (interface{}, error) {
 		return nil, ErrQueueClosed
 	}
 
-	// Return the first object from the first segment
 	obj, err := q.firstSegment.peek()
 	if err == errEmptySegment {
 		return nil, ErrEmpty
 	}
 	if err != nil {
-		// In reality this will (i.e. should not) never happen
 		return nil, errors.Wrap(err, "error getting item from the first segment")
 	}
 
@@ -355,8 +331,6 @@ func (q *DQue) DequeueBlock() (interface{}, error) {
 		obj, err := q.dequeueLocked()
 		if err == ErrEmpty {
 			q.emptyCond.Wait()
-			// Wait() atomically unlocks mutexEmptyCond and suspends execution of the calling goroutine.
-			// Receiving the signal does not guarantee an item is available, let's loop and check again.
 			continue
 		} else if err != nil {
 			return nil, err
@@ -373,8 +347,6 @@ func (q *DQue) PeekBlock() (interface{}, error) {
 		obj, err := q.peekLocked()
 		if err == ErrEmpty {
 			q.emptyCond.Wait()
-			// Wait() atomically unlocks mutexEmptyCond and suspends execution of the calling goroutine.
-			// Receiving the signal does not guarantee an item is available, let's loop and check again.
 			continue
 		} else if err != nil {
 			return nil, err
@@ -391,7 +363,6 @@ func (q *DQue) Size() int {
 		return 0
 	}
 
-	// This is heavy-handed but it is safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -400,11 +371,6 @@ func (q *DQue) Size() int {
 
 // SizeUnsafe returns the approximate number of items in the queue.  Use Size() if
 // having the exact size is important to your use-case.
-//
-// The return value could be wildly inaccurate if the itemsPerSegment value has
-// changed since the queue was last empty.
-// Also, because this method is not synchronized, the size may change after
-// entering this method.
 func (q *DQue) SizeUnsafe() int {
 	if q.fileLock == nil {
 		return 0
@@ -416,7 +382,7 @@ func (q *DQue) SizeUnsafe() int {
 	return q.firstSegment.size() + (numSegmentsBetween * q.config.ItemsPerSegment) + q.lastSegment.size()
 }
 
-// SegmentNumbers returns the number of both the first last segmment.
+// SegmentNumbers returns the number of both the first and last segment.
 // There is likely no use for this information other than testing.
 func (q *DQue) SegmentNumbers() (int, int) {
 	if q.fileLock == nil {
@@ -425,18 +391,14 @@ func (q *DQue) SegmentNumbers() (int, int) {
 	return q.firstSegment.number, q.lastSegment.number
 }
 
-// Turbo returns true if the turbo flag is on.  Having turbo on speeds things
-// up significantly.
+// Turbo returns true if the turbo flag is on.
 func (q *DQue) Turbo() bool {
 	return q.turbo
 }
 
 // TurboOn allows the filesystem to decide when to sync file changes to disk.
-// Throughput is greatly increased by turning turbo on, however there is some
-// risk of losing data if a power-loss occurs.
-// If turbo is already on an error is returned
+// If turbo is already on an error is returned.
 func (q *DQue) TurboOn() error {
-	// This is heavy-handed but it is safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -453,11 +415,9 @@ func (q *DQue) TurboOn() error {
 	return nil
 }
 
-// TurboOff re-enables the "safety" mode that syncs every file change to disk as
-// they happen.
-// If turbo is already off an error is returned
+// TurboOff re-enables the "safety" mode that syncs every file change to disk.
+// If turbo is already off an error is returned.
 func (q *DQue) TurboOff() error {
-	// This is heavy-handed but it is safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -479,9 +439,8 @@ func (q *DQue) TurboOff() error {
 }
 
 // TurboSync allows you to fsync changes to disk, but only if turbo is on.
-// If turbo is off an error is returned
+// If turbo is off an error is returned.
 func (q *DQue) TurboSync() error {
-	// This is heavy-handed but it is safe
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 
@@ -503,18 +462,15 @@ func (q *DQue) TurboSync() error {
 // load populates the queue from disk
 func (q *DQue) load() error {
 
-	// Find all queue files
-	files, err := ioutil.ReadDir(q.fullPath)
+	files, err := os.ReadDir(q.fullPath)
 	if err != nil {
 		return errors.Wrap(err, "unable to read files in "+q.fullPath)
 	}
 
-	// Find the smallest and the largest file numbers
 	minNum := math.MaxInt32
 	maxNum := 0
 	for _, f := range files {
 		if !f.IsDir() && filePattern.MatchString(f.Name()) {
-			// Extract number out of the filename
 			fileNumStr := filePattern.FindStringSubmatch(f.Name())[1]
 			fileNum, _ := strconv.Atoi(fileNumStr)
 			if fileNum > maxNum {
@@ -526,33 +482,18 @@ func (q *DQue) load() error {
 		}
 	}
 
-	// If files were found, set q.firstSegment and q.lastSegment
 	if maxNum > 0 {
 
-		// We found files
-		for {
-			seg, err := openQueueSegment(q.fullPath, minNum, q.turbo, q.builder)
-			if err != nil {
-				return errors.Wrap(err, "unable to create queue segment in "+q.fullPath)
-			}
-			// Make sure the first segment is not empty or it's not complete (i.e. is current)
-			if seg.size() > 0 || seg.sizeOnDisk() < q.config.ItemsPerSegment {
-				q.firstSegment = seg
-				break
-			}
-			// Delete the segment as it's empty and complete
-			seg.delete()
-			// Try the next one
-			minNum++
+		seg, err := openQueueSegment(q.fullPath, minNum, q.turbo, q.builder, q.codec)
+		if err != nil {
+			return errors.Wrap(err, "unable to create queue segment in "+q.fullPath)
 		}
+		q.firstSegment = seg
 
 		if minNum == maxNum {
-			// We have only one segment so the
-			// first and last are the same instance (in this case)
 			q.lastSegment = q.firstSegment
 		} else {
-			// We have multiple segments
-			seg, err := openQueueSegment(q.fullPath, maxNum, q.turbo, q.builder)
+			seg, err = openQueueSegment(q.fullPath, maxNum, q.turbo, q.builder, q.codec)
 			if err != nil {
 				return errors.Wrap(err, "unable to create segment for "+q.fullPath)
 			}
@@ -560,13 +501,11 @@ func (q *DQue) load() error {
 		}
 
 	} else {
-		// We found no files so build a new queue starting with segment 1
-		seg, err := newQueueSegment(q.fullPath, 1, q.turbo, q.builder)
+		seg, err := newQueueSegment(q.fullPath, 1, q.turbo, q.builder, q.codec)
 		if err != nil {
 			return errors.Wrap(err, "unable to create queue segment in "+q.fullPath)
 		}
 
-		// The first and last are the same instance (in this case)
 		q.firstSegment = seg
 		q.lastSegment = seg
 	}
